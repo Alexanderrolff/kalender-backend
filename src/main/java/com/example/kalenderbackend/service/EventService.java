@@ -10,9 +10,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
-import java.util.Optional;
 
 @Service
 @Transactional
@@ -24,88 +23,28 @@ public class EventService {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private AchievementService achievementService;
+
     // Create new event
     public Event createEvent(Event event) {
-        // Set default XP if not specified
-        if (event.getXpReward() == null) {
-            event.setXpReward(calculateXpReward(event));
-        }
+        event.setCreatedAt(LocalDateTime.now());
         return eventRepository.save(event);
     }
 
-    // Update existing event
-    public Event updateEvent(Long eventId, Event updatedEvent) {
-        Event existing = eventRepository.findById(eventId)
-                .orElseThrow(() -> new RuntimeException("Event not found"));
-
-        existing.setTitle(updatedEvent.getTitle());
-        existing.setDescription(updatedEvent.getDescription());
-        existing.setStartTime(updatedEvent.getStartTime());
-        existing.setEndTime(updatedEvent.getEndTime());
-        existing.setLocation(updatedEvent.getLocation());
-        existing.setCategory(updatedEvent.getCategory());
-        existing.setColor(updatedEvent.getColor());
-        existing.setReminder(updatedEvent.getReminder());
-        existing.setReminderMinutes(updatedEvent.getReminderMinutes());
-
-        return eventRepository.save(existing);
-    }
-
-    // Mark event as completed and award XP
-    public Event completeEvent(Long eventId, Long userId) {
-        Event event = eventRepository.findById(eventId)
-                .orElseThrow(() -> new RuntimeException("Event not found"));
-
-        if (!event.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
-        }
-
-        if (!event.getCompleted()) {
-            event.setCompleted(true);
-
-            // Award XP to user
-            User user = event.getUser();
-            user.setExperiencePoints(user.getExperiencePoints() + event.getXpReward());
-
-            // Check for level up
-            int newLevel = calculateLevel(user.getExperiencePoints());
-            if (newLevel > user.getLevel()) {
-                user.setLevel(newLevel);
-                // Could trigger level up notification here
-            }
-
-            userRepository.save(user);
-            return eventRepository.save(event);
-        }
-
-        return event;
-    }
-
-    // Delete event
-    public void deleteEvent(Long eventId, Long userId) {
-        Event event = eventRepository.findById(eventId)
-                .orElseThrow(() -> new RuntimeException("Event not found"));
-
-        if (!event.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
-        }
-
-        eventRepository.delete(event);
-    }
-
-    // Get events for a user
+    // Get all events for user
     public List<Event> getUserEvents(Long userId) {
         return eventRepository.findByUserId(userId);
     }
 
-    // Get events for a specific date
+    // Get events by date
     public List<Event> getEventsByDate(Long userId, LocalDate date) {
         LocalDateTime startOfDay = date.atStartOfDay();
-        LocalDateTime endOfDay = date.atTime(LocalTime.MAX);
+        LocalDateTime endOfDay = date.atTime(23, 59, 59);
         return eventRepository.findByUserIdAndStartTimeBetween(userId, startOfDay, endOfDay);
     }
 
-    // Get events for a date range (week/month view)
+    // Get events by date range
     public List<Event> getEventsByDateRange(Long userId, LocalDateTime start, LocalDateTime end) {
         return eventRepository.findByUserIdAndStartTimeBetween(userId, start, end);
     }
@@ -120,43 +59,196 @@ public class EventService {
         return eventRepository.findByUserIdAndCategory(userId, category);
     }
 
+    // Update event
+    public Event updateEvent(Long eventId, Event updatedEvent) {
+        Event existingEvent = eventRepository.findById(eventId)
+                .orElseThrow(() -> new RuntimeException("Event not found"));
+
+        existingEvent.setTitle(updatedEvent.getTitle());
+        existingEvent.setDescription(updatedEvent.getDescription());
+        existingEvent.setCategory(updatedEvent.getCategory());
+        existingEvent.setStartTime(updatedEvent.getStartTime());
+        existingEvent.setEndTime(updatedEvent.getEndTime());
+        existingEvent.setAllDay(updatedEvent.isAllDay());
+        existingEvent.setPriority(updatedEvent.getPriority());
+        existingEvent.setRecurring(updatedEvent.isRecurring());
+        existingEvent.setRecurrencePattern(updatedEvent.getRecurrencePattern());
+
+        return eventRepository.save(existingEvent);
+    }
+
+    // Complete event and award XP
+    public Event completeEvent(Long eventId, Long userId) {
+        Event event = eventRepository.findByIdAndUserId(eventId, userId)
+                .orElseThrow(() -> new RuntimeException("Event not found or unauthorized"));
+
+        if (event.isCompleted()) {
+            throw new RuntimeException("Event already completed");
+        }
+
+        event.setCompleted(true);
+        event.setCompletedAt(LocalDateTime.now());
+
+        // Calculate XP based on priority and category
+        int baseXP = calculateXP(event);
+        event.setXpReward(baseXP);
+
+        // Update user stats
+        User user = event.getUser();
+        user.setXp(user.getXp() + baseXP);
+        user.setTotalXP(user.getTotalXP() + baseXP);
+        user.setEventsCompleted(user.getEventsCompleted() + 1);
+
+        // Update streak
+        updateUserStreak(user);
+
+        // Check for level up
+        checkAndUpdateLevel(user);
+
+        // Save event and user
+        eventRepository.save(event);
+        userRepository.save(user);
+
+        // Check for new achievements
+        achievementService.checkAndUnlockAchievements(userId);
+
+        return event;
+    }
+
+    // Calculate XP based on event properties
+    private int calculateXP(Event event) {
+        int baseXP = 10; // Base XP for completing any event
+
+        // Add bonus based on category
+        switch (event.getCategory().toUpperCase()) {
+            case "WORK":
+            case "STUDY":
+                baseXP += 5;
+                break;
+            case "EXERCISE":
+            case "HEALTH":
+                baseXP += 10;
+                break;
+            case "SOCIAL":
+                baseXP += 3;
+                break;
+            case "PERSONAL":
+                baseXP += 2;
+                break;
+        }
+
+        // Add bonus based on priority
+        switch (event.getPriority()) {
+            case HIGH:
+                baseXP += 5;
+                break;
+            case MEDIUM:
+                baseXP += 3;
+                break;
+            case LOW:
+                baseXP += 1;
+                break;
+        }
+
+        // Streak bonus
+        User user = event.getUser();
+        if (user.getCurrentStreakDays() >= 7) {
+            baseXP = (int) (baseXP * 1.5); // 50% bonus for week streak
+        } else if (user.getCurrentStreakDays() >= 3) {
+            baseXP = (int) (baseXP * 1.25); // 25% bonus for 3-day streak
+        }
+
+        return baseXP;
+    }
+
+    // Update user's streak
+    private void updateUserStreak(User user) {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime lastEventDate = user.getLastEventDate();
+
+        if (lastEventDate == null) {
+            // First event ever
+            user.setCurrentStreakDays(1);
+            user.setStreakStartDate(now);
+        } else {
+            long daysBetween = ChronoUnit.DAYS.between(lastEventDate.toLocalDate(), now.toLocalDate());
+
+            if (daysBetween == 0) {
+                // Same day, streak continues
+            } else if (daysBetween == 1) {
+                // Next day, increase streak
+                user.setCurrentStreakDays(user.getCurrentStreakDays() + 1);
+            } else {
+                // Streak broken, reset
+                user.setCurrentStreakDays(1);
+                user.setStreakStartDate(now);
+            }
+        }
+
+        user.setLastEventDate(now);
+    }
+
+    // Check and update user level
+    private void checkAndUpdateLevel(User user) {
+        int currentXP = user.getXp();
+        int currentLevel = user.getLevel();
+        int xpForNextLevel = 100 * currentLevel; // XP needed for next level
+
+        while (currentXP >= xpForNextLevel) {
+            currentXP -= xpForNextLevel;
+            currentLevel++;
+            xpForNextLevel = 100 * currentLevel;
+        }
+
+        user.setLevel(currentLevel);
+        user.setXp(currentXP);
+    }
+
+    // Delete event
+    public void deleteEvent(Long eventId, Long userId) {
+        Event event = eventRepository.findByIdAndUserId(eventId, userId)
+                .orElseThrow(() -> new RuntimeException("Event not found or unauthorized"));
+
+        // If event was completed, remove XP
+        if (event.isCompleted()) {
+            User user = event.getUser();
+            user.setXp(Math.max(0, user.getXp() - event.getXpReward()));
+            user.setEventsCompleted(Math.max(0, user.getEventsCompleted() - 1));
+            userRepository.save(user);
+        }
+
+        eventRepository.delete(event);
+    }
+
     // Get user statistics
     public EventStats getUserStats(Long userId) {
-        Long completed = eventRepository.countByUserIdAndCompleted(userId, true);
-        Long total = eventRepository.countByUserIdAndCompleted(userId, false) + completed;
-        return new EventStats(total, completed);
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        EventStats stats = new EventStats();
+        stats.totalEvents = eventRepository.countByUserId(userId);
+        stats.completedEvents = eventRepository.countByUserIdAndCompleted(userId, true);
+        stats.pendingEvents = eventRepository.countByUserIdAndCompleted(userId, false);
+        stats.todayEvents = getEventsByDate(userId, LocalDate.now()).size();
+        stats.currentStreak = user.getCurrentStreakDays();
+        stats.level = user.getLevel();
+        stats.currentXP = user.getXp();
+        stats.totalXP = user.getTotalXP();
+        stats.achievementsUnlocked = user.getAchievementsUnlocked();
+
+        return stats;
     }
 
-    // Calculate XP reward based on event duration/category
-    private int calculateXpReward(Event event) {
-        int baseXp = 10;
-
-        // Bonus for longer events
-        long duration = java.time.Duration.between(event.getStartTime(), event.getEndTime()).toHours();
-        if (duration >= 2) baseXp += 5;
-        if (duration >= 4) baseXp += 10;
-
-        // Category bonuses
-        if ("Work".equals(event.getCategory())) baseXp += 5;
-        if ("Fitness".equals(event.getCategory())) baseXp += 10;
-        if ("Learning".equals(event.getCategory())) baseXp += 8;
-
-        return baseXp;
-    }
-
-    // Calculate level from XP (100 XP per level)
-    private int calculateLevel(int xp) {
-        return (xp / 100) + 1;
-    }
-
-    // Inner class for statistics
+    // Statistics DTO
     public static class EventStats {
-        public final Long totalEvents;
-        public final Long completedEvents;
-
-        public EventStats(Long total, Long completed) {
-            this.totalEvents = total;
-            this.completedEvents = completed;
-        }
+        public long totalEvents;
+        public long completedEvents;
+        public long pendingEvents;
+        public int todayEvents;
+        public int currentStreak;
+        public int level;
+        public int currentXP;
+        public int totalXP;
+        public int achievementsUnlocked;
     }
 }
